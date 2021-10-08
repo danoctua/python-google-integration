@@ -20,28 +20,40 @@ class GoogleDriveService(BaseGoogleService):
 
     default_page_size: int
 
-    def __init__(self):
+    def __init__(self, support_all_drives: bool = False, drive_id: str = None, *args, **kwargs):
         scopes = [GOOGLE_DRIVE_SCOPES.get(scope) for scope in USED_SCOPES]
         self.default_page_size = GOOGLE_DRIVE_DEFAULT_PAGE_SIZE
-        super().__init__(scopes=scopes, service_name="drive", version="v3")
+        self.support_all_drives = support_all_drives
+        self.drive_id = drive_id
+        super().__init__(scopes=scopes, service_name="drive", version="v3", *args, **kwargs)
 
-    def _list_resources(self, query, page_size: Optional[int] = None) -> tuple[str, list]:
+    def _list_resources(self, query, page_size: Optional[int] = None, limit: Optional[int] = None) -> list:
         """List all resources filtered with query.
 
         :param query: query string
         :param page_size: number of items to be returned
+        :param limit: max number of records to be fetched
         :return: tuple - next page token, and items returned by the query
         """
-        result = self.service.files().list(
-            pageSize=page_size or self.default_page_size,
-            q=query,
-            fields="nextPageToken, files",
-            orderBy="createdTime"
-        ).execute()
-        next_page_token = result.get("nextPageToken")
-        items = result.get("files", [])
+        resources: list = []
+        while True:
+            result = self.service.files().list(
+                pageSize=page_size or self.default_page_size,
+                q=query,
+                fields="nextPageToken, files",
+                orderBy="createdTime",
+                supportsAllDrives=self.support_all_drives,
+                driveId=self.drive_id,
+                corpora="drive",
+                includeItemsFromAllDrives=True
+            ).execute()
+            resources += result.get("files", [])
 
-        return next_page_token, items
+            next_page_token = result.get("nextPageToken")
+            if not next_page_token or (limit and len(resources) > limit):
+                break
+
+        return resources[:limit]
 
     def _log_items(self, items: list[dict]) -> None:
         """Log items by printing their name and ID
@@ -64,7 +76,7 @@ class GoogleDriveService(BaseGoogleService):
         :return: list of files
         """
         query = query_constructor(mime_type=GOOGLE_DRIVE_MIME_TYPES['file'], parent_id=parent_id)
-        next_page_token, items = self._list_resources(query)
+        items = self._list_resources(query)
         self._log_items(items)
 
         return items
@@ -77,7 +89,7 @@ class GoogleDriveService(BaseGoogleService):
         :return: list of folders
         """
         query = query_constructor(mime_type=GOOGLE_DRIVE_MIME_TYPES['folder'], parent_id=parent_id)
-        next_page_token, items = self._list_resources(query)
+        items = self._list_resources(query)
 
         self._log_items(items)
 
@@ -115,7 +127,12 @@ class GoogleDriveService(BaseGoogleService):
         :param media_body: media body that would be uploaded to the Google Drive
         :return: resource ID
         """
-        resource = self.service.files().create(body=resource_metadata, fields='id', media_body=media_body).execute()
+        resource = self.service.files().create(
+            body=resource_metadata,
+            fields='id',
+            media_body=media_body,
+            supportsAllDrives=self.support_all_drives,
+        ).execute()
 
         return resource['id']
 
@@ -129,7 +146,7 @@ class GoogleDriveService(BaseGoogleService):
         parent_id = parent_id or GOOGLE_DRIVE_ROOT_FOLDER_NAME
         query = query_constructor(mime_type=GOOGLE_DRIVE_MIME_TYPES['folder'], parent_id=parent_id, name=folder_name)
 
-        _, items = self._list_resources(query)
+        items = self._list_resources(query)
         if not items:
             self.logger.warning(f"Query returned no folder with desired name.")
         elif len(items) > 2:
@@ -170,7 +187,8 @@ class GoogleDriveService(BaseGoogleService):
         :return: parent ID to the last folder in the path
         """
         parents: list[str] = path.split(splitter)
-        parent_id: Optional[str] = None
+        # Set parent to the root ID (drive ID for shared drive)
+        parent_id: Optional[str] = self.drive_id
         for folder_name in parents:
             if not folder_name:
                 continue
